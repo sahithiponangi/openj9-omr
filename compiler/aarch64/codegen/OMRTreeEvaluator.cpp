@@ -37,6 +37,8 @@
 #include "il/ParameterSymbol.hpp"
 #include "il/StaticSymbol.hpp"
 
+#define MAX_ARM64_ARRAYCOPY_INLINE 256
+
 TR::Instruction *loadAddressConstantInSnippet(TR::CodeGenerator *cg, TR::Node *node, intptr_t address, TR::Register *targetRegister, TR_ExternalRelocationTargetKind reloKind, TR::Instruction *cursor)
    {
    // We use LDR literal to load a value from the snippet. Offset to PC will be patched by LabelRelative24BitRelocation
@@ -637,11 +639,239 @@ OMR::ARM64::TreeEvaluator::arraycmpEvaluator(TR::Node *node, TR::CodeGenerator *
 	return OMR::ARM64::TreeEvaluator::unImpOpEvaluator(node, cg);
 	}
 
+bool OMR::ARM64::TreeEvaluator::stopUsingCopyReg(
+      TR::Node* node,
+      TR::Register*& reg,
+      TR::CodeGenerator* cg)
+   {
+   if (node != NULL)
+      {
+      reg = cg->evaluate(node);
+      if (!cg->canClobberNodesRegister(node))
+         {
+         TR::Register *copyReg;
+         if (reg->containsInternalPointer() ||
+             !reg->containsCollectedReference())
+            {
+            copyReg = cg->allocateRegister();
+            if (reg->containsInternalPointer())
+               {
+               copyReg->setPinningArrayPointer(reg->getPinningArrayPointer());
+               copyReg->setContainsInternalPointer();
+               }
+            }
+         else
+            copyReg = cg->allocateCollectedReferenceRegister();
+
+         generateTrg1Src1Instruction(cg, TR::InstOpCode::ldrimmx, node, copyReg, reg);
+         reg = copyReg;
+         return true;
+         }
+      }
+
+   return false;
+   }
+
 TR::Register *
 OMR::ARM64::TreeEvaluator::arraycopyEvaluator(TR::Node *node, TR::CodeGenerator *cg)
 	{
-	// TODO:ARM64: Enable TR::TreeEvaluator::arraycopyEvaluator in compiler/aarch64/codegen/TreeEvaluatorTable.hpp when Implemented.
-	return OMR::ARM64::TreeEvaluator::unImpOpEvaluator(node, cg);
+   if (debug("noArrayCopy"))
+      {
+      TR::ILOpCodes opCode = node->getOpCodeValue();
+      TR::Node::recreate(node, TR::call);
+      TR::Register *targetRegister = TR::TreeEvaluator::directCallEvaluator(node, cg);
+      TR::Node::recreate(node, opCode);
+      return targetRegister;
+      }
+
+   bool simpleCopy = (node->getNumChildren()==3);
+
+   // Evaluate for fast arrayCopy implementation. For simple arrayCopy:
+   //      child 0 ------  Source byte address;
+   //      child 1 ------  Destination byte address;
+   //      child 2 ------  Copy length in byte;
+   // Otherwise:
+   //      child 0 ------  Source array object;
+   //      child 1 ------  Destination array object;
+   //      child 2 ------  Source byte address;
+   //      child 3 ------  Destination byte address;
+   //      child 4 ------  Copy length in byte;
+
+   TR::Compilation *comp = cg->comp();
+   TR::Instruction      *gcPoint;
+   TR::Node             *srcObjNode, *dstObjNode, *srcAddrNode, *dstAddrNode, *lengthNode;
+   TR::Register         *srcObjReg=NULL, *dstObjReg=NULL, *srcAddrReg, *dstAddrReg, *lengthReg;
+   bool stopUsingCopyReg1, stopUsingCopyReg2, stopUsingCopyReg3, stopUsingCopyReg4, stopUsingCopyReg5 = false;
+
+   if (simpleCopy)
+      {
+      srcObjNode = NULL;
+      dstObjNode = NULL;
+      srcAddrNode = node->getChild(0);
+      dstAddrNode = node->getChild(1);
+      lengthNode = node->getChild(2);
+      }
+   else
+      {
+      srcObjNode = node->getChild(0);
+      dstObjNode = node->getChild(1);
+      srcAddrNode = node->getChild(2);
+      dstAddrNode = node->getChild(3);
+      lengthNode = node->getChild(4);
+      }
+
+   stopUsingCopyReg1 = TR::TreeEvaluator::stopUsingCopyReg(srcObjNode, srcObjReg, cg);
+   stopUsingCopyReg2 = TR::TreeEvaluator::stopUsingCopyReg(dstObjNode, dstObjReg, cg);
+   stopUsingCopyReg3 = TR::TreeEvaluator::stopUsingCopyReg(srcAddrNode, srcAddrReg, cg);
+   stopUsingCopyReg4 = TR::TreeEvaluator::stopUsingCopyReg(dstAddrNode, dstAddrReg, cg);
+
+   // Inline forward arrayCopy with constant length, call the wrtbar if needed after the copy
+   if (simpleCopy &&
+        node->isForwardArrayCopy() && lengthNode->getOpCode().isLoadConst())
+      {
+      int64_t len = (lengthNode->getType().isInt32() ?
+                     lengthNode->getInt() : lengthNode->getLongInt());
+
+      // inlineArrayCopy is not currently capable of handling very long lengths correctly. Under some circumstances, it
+      // will generate an ldrimmx instruction with an out-of-bounds immediate, which triggers an assert in the binary
+      // encoder.
+      if (len>=0 && len < MAX_ARM64_ARRAYCOPY_INLINE)
+         {
+         //inlineArrayCopy(node, len, srcAddrReg, dstAddrReg, cg);
+         if (!simpleCopy)
+           {
+           cg->decReferenceCount(srcObjNode);
+           cg->decReferenceCount(dstObjNode);
+           }
+         if (stopUsingCopyReg1)
+            cg->stopUsingRegister(srcObjReg);
+         if (stopUsingCopyReg2)
+            cg->stopUsingRegister(dstObjReg);
+         if (stopUsingCopyReg3)
+            cg->stopUsingRegister(srcAddrReg);
+         if (stopUsingCopyReg4)
+            cg->stopUsingRegister(dstAddrReg);
+         cg->decReferenceCount(srcAddrNode);
+         cg->decReferenceCount(dstAddrNode);
+         cg->decReferenceCount(lengthNode);
+         return NULL;
+         }
+      }
+
+   lengthReg = cg->evaluate(lengthNode);
+   if (!cg->canClobberNodesRegister(lengthNode))
+      {
+      TR::Register *lenCopyReg = cg->allocateRegister();
+      generateTrg1Src1Instruction(cg, TR::InstOpCode::ldrimmx, lengthNode, lenCopyReg, lengthReg);
+      lengthReg = lenCopyReg;
+      stopUsingCopyReg5 = true;
+      }
+
+   TR::RegisterDependencyConditions *conditions;
+   int32_t numDeps = 12;
+
+   TR_ASSERT(numDeps != 0, "numDeps not set correctly\n");
+   conditions = new (cg->trHeapMemory()) TR::RegisterDependencyConditions(numDeps, numDeps, cg->trMemory());
+   TR::Register *cndRegister = cg->allocateRegister(TR_CCR);
+   TR::Register *tmp1Reg = cg->allocateRegister(TR_GPR);
+   TR::Register *tmp2Reg = cg->allocateRegister(TR_GPR);
+   TR::Register *tmp4Reg = cg->allocateRegister(TR_GPR);
+
+   TR::Register *tmp3Reg = NULL;
+   TR::Register *fp1Reg = NULL;
+   TR::Register *fp2Reg = NULL;
+
+   // Build up the dependency conditions
+   TR::addDependency(conditions, cndRegister, TR::RealRegister::x0, TR_CCR, cg);
+   TR::addDependency(conditions, lengthReg, TR::RealRegister::x1, TR_GPR, cg);
+   TR::addDependency(conditions, srcAddrReg, TR::RealRegister::x2, TR_GPR, cg);
+   TR::addDependency(conditions, dstAddrReg, TR::RealRegister::x3, TR_GPR, cg);
+   TR::addDependency(conditions, tmp4Reg, TR::RealRegister::x4, TR_GPR, cg);
+
+   tmp3Reg = cg->allocateRegister(TR_GPR);
+   TR::addDependency(conditions, tmp3Reg, TR::RealRegister::x5, TR_GPR, cg);
+
+   TR::addDependency(conditions, tmp1Reg, TR::RealRegister::x6, TR_GPR, cg);
+   TR::addDependency(conditions, tmp2Reg, TR::RealRegister::x7, TR_GPR, cg);
+
+   TR::addDependency(conditions, NULL, TR::RealRegister::v0, TR_FPR, cg);
+   TR::addDependency(conditions, NULL, TR::RealRegister::v1, TR_FPR, cg);
+   TR::addDependency(conditions, NULL, TR::RealRegister::v2, TR_FPR, cg);
+   TR::addDependency(conditions, NULL, TR::RealRegister::v3, TR_FPR, cg);
+
+   TR::SymbolReference *arrayCopyHelper;
+
+   if (node->isForwardArrayCopy())
+      {
+      if (node->isWordElementArrayCopy())
+         {
+            arrayCopyHelper = cg->symRefTab()->findOrCreateRuntimeHelper(TR_ARM64forwardWordArrayCopy, false, false, false);
+         }
+      else if (node->isHalfWordElementArrayCopy())
+         {
+            arrayCopyHelper = cg->symRefTab()->findOrCreateRuntimeHelper(TR_ARM64forwardHalfWordArrayCopy, false, false, false);
+         }
+      else
+         {
+            arrayCopyHelper = cg->symRefTab()->findOrCreateRuntimeHelper(TR_ARM64forwardArrayCopy, false, false, false);
+         }
+      }
+   else // We are not sure it is forward or we have to do backward
+      {
+      if (node->isWordElementArrayCopy())
+         {
+            arrayCopyHelper = cg->symRefTab()->findOrCreateRuntimeHelper(TR_ARM64wordArrayCopy, false, false, false);
+         }
+      else if (node->isHalfWordElementArrayCopy())
+         {
+            arrayCopyHelper = cg->symRefTab()->findOrCreateRuntimeHelper(TR_ARM64halfWordArrayCopy, false, false, false);
+         }
+      else
+         {
+            arrayCopyHelper = cg->symRefTab()->findOrCreateRuntimeHelper(TR_ARM64arrayCopy, false, false, false);
+         }
+      }
+
+         generateImmSymInstruction(cg, TR::InstOpCode::bl, node,
+                             (uintptr_t)arrayCopyHelper->getMethodAddress(),
+                             conditions, arrayCopyHelper, NULL);
+   conditions->stopUsingDepRegs(cg);
+
+   if (srcObjNode != NULL)
+      cg->decReferenceCount(srcObjNode);
+   if (dstObjNode != NULL)
+      cg->decReferenceCount(dstObjNode);
+   cg->decReferenceCount(srcAddrNode);
+   cg->decReferenceCount(dstAddrNode);
+   cg->decReferenceCount(lengthNode);
+   if (stopUsingCopyReg1)
+      cg->stopUsingRegister(srcObjReg);
+   if (stopUsingCopyReg2)
+      cg->stopUsingRegister(dstObjReg);
+   if (stopUsingCopyReg3)
+      cg->stopUsingRegister(srcAddrReg);
+   if (stopUsingCopyReg4)
+      cg->stopUsingRegister(dstAddrReg);
+   if (stopUsingCopyReg5)
+      cg->stopUsingRegister(lengthReg);
+   if (tmp1Reg)
+      cg->stopUsingRegister(tmp1Reg);
+   if (tmp2Reg)
+      cg->stopUsingRegister(tmp2Reg);
+   if (tmp3Reg)
+      cg->stopUsingRegister(tmp3Reg);
+   if (tmp4Reg)
+      cg->stopUsingRegister(tmp4Reg);
+   if (fp1Reg)
+      cg->stopUsingRegister(fp1Reg);
+   if (fp2Reg)
+      cg->stopUsingRegister(fp2Reg);
+
+
+   cg->machine()->setLinkRegisterKilled(true);
+   //cg->setHasCCInfo();
+
+   return NULL;
 	}
 
 TR::Register *
