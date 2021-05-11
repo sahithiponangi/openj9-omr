@@ -606,7 +606,7 @@
 #define _OverflowCHKEvaluator TR::TreeEvaluator::unImpOpEvaluator 
 #define _UnsignedOverflowCHKEvaluator TR::TreeEvaluator::unImpOpEvaluator 
 #define _BNDCHKEvaluator TR::TreeEvaluator::unImpOpEvaluator 
-#define _ArrayCopyBNDCHKEvaluator TR::TreeEvaluator::unImpOpEvaluator 
+#define _ArrayCopyBNDCHKEvaluator TR::TreeEvaluator::ArrayCopyBNDCHKEvaluator 
 #define _BNDCHKwithSpineCHKEvaluator TR::TreeEvaluator::unImpOpEvaluator 
 #define _SpineCHKEvaluator TR::TreeEvaluator::unImpOpEvaluator 
 #define _ArrayStoreCHKEvaluator TR::TreeEvaluator::unImpOpEvaluator 

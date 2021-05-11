@@ -728,11 +728,116 @@ OMR::ARM64::TreeEvaluator::BNDCHKEvaluator(TR::Node *node, TR::CodeGenerator *cg
 	return OMR::ARM64::TreeEvaluator::unImpOpEvaluator(node, cg);
 	}
 
+static TR::Instruction *compareInts(TR::ARM64ConditionCode  branchType,
+                                           TR::Node             *node,
+                                           TR::CodeGenerator    *cg,
+                                           TR::SymbolReference  *sr =  NULL)
+   {
+   TR::Node *secondChild = node->getSecondChild();
+   TR::Node *firstChild = node->getFirstChild();
+   TR::LabelSymbol *branchTarget = sr ? NULL : node->getBranchDestination()->getNode()->getLabel();
+   TR::Register *src1Reg = cg->evaluate(firstChild);
+   TR::Register *src2Reg = cg->evaluate(secondChild);
+   TR::Instruction *result;
+   bool foundConst = false;
+   if (secondChild->getOpCode().isLoadConst())
+      {
+      int64_t value = secondChild->get64bitIntegralValue();
+      int32_t cmpValue = secondChild->getInt();
+      bool negated = cmpValue < 0 && cmpValue != 0x80000000;
+      if (value >= (-(1 << 15)) && value <= ((1 << 15) - 1))
+         {
+         generateCompareImmInstruction(cg, node, src1Reg, value);
+         }
+      else
+         {
+         generateCompareInstruction(cg, node, src1Reg, src2Reg);
+         }
+      foundConst = true;
+      }
+   if(!foundConst)
+      generateCompareInstruction(cg, node, src1Reg, src2Reg);
+
+   TR::RegisterDependencyConditions *deps = NULL;
+   if (node->getNumChildren() == 3)
+      {
+      TR::Node *thirdChild = node->getChild(2);
+
+      TR_ASSERT(thirdChild->getOpCodeValue() == TR::GlRegDeps,
+             "The third child of a compare must be a TR::GlRegDeps");
+
+      cg->evaluate(thirdChild);
+
+      // NB: must generate reg deps before the conditonal branch
+      deps = generateRegisterDependencyConditions(cg, thirdChild, 0);
+      thirdChild->decReferenceCount();  // IS it correct to decReferenceCount before the instruction generation ?!!!
+      }
+
+   if (!sr)
+      {
+      result = generateConditionalBranchInstruction(cg, TR::InstOpCode::b_cond, node, branchTarget, branchType, deps);
+      }
+   else
+      {
+      cg->addSnippet(new (cg->trHeapMemory()) TR::ARM64HelperCallSnippet(cg, node, branchTarget, sr));
+      cg->machine()->setLinkRegisterKilled(true);
+      }
+
+   cg->decReferenceCount(firstChild);
+   cg->decReferenceCount(secondChild);
+   return NULL;
+   }
+
 TR::Register *
 OMR::ARM64::TreeEvaluator::ArrayCopyBNDCHKEvaluator(TR::Node *node, TR::CodeGenerator *cg)
 	{
-	// TODO:ARM64: Enable TR::TreeEvaluator::ArrayCopyBNDCHKEvaluator in compiler/aarch64/codegen/TreeEvaluatorTable.hpp when Implemented.
-	return OMR::ARM64::TreeEvaluator::unImpOpEvaluator(node, cg);
+   // TODO - check this code
+   // check that child[0] >= child[1], if not branch to check failure
+   //
+   // If the first child is a constant and the second isn't, swap the children.
+   //
+
+   TR::Node *firstChild = node->getFirstChild();
+   TR::Node *secondChild = node->getSecondChild();
+   TR::SymbolReference *BNDCHKException = node->getSymbolReference();
+   TR::Instruction *instr;
+
+   if (firstChild->getOpCode().isLoadConst())
+      {
+      if (secondChild->getOpCode().isLoadConst())
+         {
+         if (firstChild->getInt() < secondChild->getInt())
+            {
+            // Check will always fail, just jump to the exception handler
+            instr = generateImmSymInstruction(cg, TR::InstOpCode::bl, node, (uintptr_t)BNDCHKException->getMethodAddress(), NULL, BNDCHKException, NULL);
+            cg->machine()->setLinkRegisterKilled(true);
+            }
+         else
+            {
+            // Check will always succeed, no need for an instruction
+            instr = NULL;
+            }
+         cg->decReferenceCount(firstChild);
+         cg->decReferenceCount(secondChild);
+         }
+      else
+         {
+         node->swapChildren();
+         instr = compareInts(TR::CC_GT, node, cg, BNDCHKException);
+         node->swapChildren();
+         }
+      }
+   else
+      {
+      instr = compareInts(TR::CC_LT, node, cg, BNDCHKException);
+      }
+
+   if (instr)
+      {
+      instr->ARM64NeedsGCMap(cg, 0xFFFFFFFF);
+      }
+
+   return NULL;
 	}
 
 TR::Register *
