@@ -91,7 +91,8 @@ OMR::ARM64::CodeGenerator::initialize()
    cg->setLiveRegisters(new (cg->trHeapMemory()) TR_LiveRegisters(comp), TR_FPR);
 
    cg->setSupportsVirtualGuardNOPing();
-
+   cg->setSupportsPrimitiveArrayCopy();
+   cg->setSupportsReferenceArrayCopy();
    cg->setSupportsRecompilation();
 
    cg->setSupportsSelect();
