@@ -1778,7 +1778,7 @@ OMR::ARM64::TreeEvaluator::ArrayCopyBNDCHKEvaluator(TR::Node *node, TR::CodeGene
       {
       if (secondChild->getOpCode().isLoadConst())
          {
-         if (firstChild->getInt() < secondChild->getInt())
+         if (firstChild->getLongInt() < secondChild->getLongInt())
             {
             // Check will always fail, just jump to the exception handler
             instr = generateImmSymInstruction(cg, TR::InstOpCode::bl, node, (uintptr_t)exceptionBNDCHK->getMethodAddress(), NULL, exceptionBNDCHK, NULL);
